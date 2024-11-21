@@ -97,9 +97,10 @@ class HloHardwareIndependentTestBase : public ::testing::Test {
 
   // Parses the given string and returns module as a VerifiedHloModule.
   absl::StatusOr<std::unique_ptr<VerifiedHloModule>>
-  ParseAndReturnVerifiedModule(absl::string_view hlo_text,
-                               int64_t replica_count = 1,
-                               int64_t num_partitions = 1) const;
+  ParseAndReturnVerifiedModule(
+      absl::string_view hlo_text, int64_t replica_count = 1,
+      int64_t num_partitions = 1,
+      std::optional<DeviceAssignment> device_assignment = std::nullopt) const;
   absl::StatusOr<std::unique_ptr<VerifiedHloModule>>
   ParseAndReturnVerifiedModule(absl::string_view hlo_text,
                                const HloModuleConfig& config) const;
