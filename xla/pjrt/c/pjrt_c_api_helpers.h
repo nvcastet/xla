@@ -360,6 +360,10 @@ int64_t GetTracemeContextId(InputType* args) {
 std::vector<xla::PjRtMemorySpaceDescription> GetMemorySpaceDescriptions(
     PJRT_DeviceDescription* device_description, const PJRT_Api* c_api);
 
+PJRT_Error* InvokePjRtEventWhenReady(
+    const PJRT_Api* api, PJRT_Event* event,
+    absl::AnyInvocable<void() &&> on_done_with_event);
+
 }  // namespace pjrt
 
 #endif  // XLA_PJRT_C_PJRT_C_API_HELPERS_H_
