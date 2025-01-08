@@ -256,12 +256,12 @@ HloHardwareIndependentTestBase::RunAndCheckHloRewrite(
     bool expect_change, FixedMapping params) const {
   std::string hlo_string = absl::StrReplaceAll(hlo_template, params);
   SCOPED_TRACE("Input HLO: " + hlo_string);
-  VLOG(7) << "Input HLO: " << hlo_string;
+  VLOG(0) << "Input HLO: " << hlo_string;
   TF_ASSIGN_OR_RETURN(std::unique_ptr<HloModule> module,
                       ParseAndReturnVerifiedModule(hlo_string));
-  VLOG(7) << "Input HLO parsed. Running the pass:  + " << hlo_pass.name();
+  VLOG(0) << "Input HLO parsed. Running the pass:  + " << hlo_pass.name();
   TF_ASSIGN_OR_RETURN(bool changed, RunHloPass(hlo_pass, module.get()));
-  VLOG(7) << "Output HLO: "
+  VLOG(0) << "Output HLO: "
           << module->ToString(HloPrintOptions::ShortParsable()
                                   .set_print_control_dependencies(true));
   EXPECT_EQ(changed, expect_change);

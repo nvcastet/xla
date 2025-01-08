@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -44,26 +45,13 @@ using ::testing::HasSubstr;
 namespace op = xla::testing::opcode_matchers;
 using Pass = CollectivePermuteDecomposer;
 
-std::string SourceTargetPairs(HloInstruction* instr) {
-  return instr->frontend_attributes().map().at(kSendRecvSourceTargetPairsAttr);
-}
-
-absl::StatusOr<HloInstruction*> FindWithPairs(
-    HloModule& module, absl::string_view name,
-    absl::string_view expected_source_target_pairs) {
-  HloInstruction* instr =
-      HloHardwareIndependentTestBase::FindInstruction(&module, name);
-  if (instr == nullptr) {
-    return absl::NotFoundError(
-        absl::StrCat("Instruction ", name, " not found"));
-  }
-  if (SourceTargetPairs(instr) != expected_source_target_pairs) {
-    return absl::InternalError(absl::StrCat(
-        "Instruction ", name, " doesn't have expected pairs",
-        expected_source_target_pairs, " actual: ", SourceTargetPairs(instr)));
-  }
-  return instr;
-}
+struct Decomposed {
+  HloInstruction* after_all;
+  HloInstruction* send;
+  HloInstruction* recv;
+  HloInstruction* send_done;
+  HloInstruction* recv_done;
+};
 
 class DecomposerTest : public HloHardwareIndependentTestBase {
  protected:
@@ -75,6 +63,23 @@ class DecomposerTest : public HloHardwareIndependentTestBase {
   };
   void AssertTransform(absl::string_view hlo, int64_t threshold = 0) {
     TF_ASSERT_OK(RunAndCheckHloRewrite(hlo, Pass(threshold), true));
+  };
+  Decomposed FindComponents(HloModule* module, absl::string_view cp_name) {
+    Decomposed result;
+    result.after_all =
+        FindInstruction(module, absl::StrCat(cp_name, "-after-all"));
+    result.send = FindInstruction(module, absl::StrCat(cp_name, "-send"));
+    result.recv = FindInstruction(module, absl::StrCat(cp_name, "-recv"));
+    result.send_done =
+        FindInstruction(module, absl::StrCat(cp_name, "-send-done"));
+    result.recv_done =
+        FindInstruction(module, absl::StrCat(cp_name, "-recv-done"));
+    CHECK(result.after_all != nullptr);
+    CHECK(result.send != nullptr);
+    CHECK(result.recv != nullptr);
+    CHECK(result.send_done != nullptr);
+    CHECK(result.recv_done != nullptr);
+    return result;
   }
 };
 
@@ -122,20 +127,13 @@ TEST_F(DecomposerTest, ControlDependency_IndependentCPs) {
       ROOT out = (u32[],u32[],u32[]) tuple(cp1, cp2, cp3)
     })";
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, Transform(hlo));
-  TF_ASSERT_OK_AND_ASSIGN(HloInstruction * send,
-                          FindWithPairs(*module, "send", "{{3,0}}"));
-  TF_ASSERT_OK_AND_ASSIGN(
-      HloInstruction * send_1,
-      FindWithPairs(*module, "send.1", "{{0,1},{1,2},{2,3}}"));
-  TF_ASSERT_OK_AND_ASSIGN(
-      HloInstruction * recv_1,
-      FindWithPairs(*module, "recv.1", "{{0,1},{1,2},{2,3}}"));
-  TF_ASSERT_OK_AND_ASSIGN(HloInstruction * recv_2,
-                          FindWithPairs(*module, "recv.2", "{{6,7}}"));
+  Decomposed cp1 = FindComponents(module.get(), "cp1");
+  Decomposed cp2 = FindComponents(module.get(), "cp2");
+  Decomposed cp3 = FindComponents(module.get(), "cp3");
   // Expect the CPs to be sorted by name before inserting control dependencies.
   // Event though cp3 comes before cp1, decomposed cp1 is placed first.
-  EXPECT_THAT(recv_1->control_predecessors(), ElementsAre(send));
-  EXPECT_THAT(recv_2->control_predecessors(), ElementsAre(send_1));
+  EXPECT_THAT(cp2.recv->control_predecessors(), ElementsAre(cp1.send));
+  EXPECT_THAT(cp3.recv->control_predecessors(), ElementsAre(cp2.send));
 }
 
 // Negative test to assure that the decomposer does not create cyclic
@@ -148,12 +146,9 @@ TEST_F(DecomposerTest, ControlDependency_BasicDependency) {
       ROOT cp-b = f32[] collective-permute(cp-a), source_target_pairs={{3,0}}
     })";
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, Transform(hlo));
-  TF_ASSERT_OK_AND_ASSIGN(
-      HloInstruction * send,
-      FindWithPairs(*module, "send", "{{0,1},{1,2},{2,3}}"));
-  TF_ASSERT_OK_AND_ASSIGN(HloInstruction * recv_1,
-                          FindWithPairs(*module, "recv.1", "{{3,0}}"));
-  EXPECT_THAT(recv_1->control_predecessors(), ElementsAre(send))
+  Decomposed cp_a = FindComponents(module.get(), "cp-a");
+  Decomposed cp_b = FindComponents(module.get(), "cp-b");
+  EXPECT_THAT(cp_b.recv->control_predecessors(), ElementsAre(cp_a.send))
       << "Recv-start from cp1 should depend on send start from cp2";
 }
 
@@ -162,26 +157,35 @@ TEST_F(DecomposerTest, ControlDependency_MoreDependencies) {
     ENTRY test_computation {
       data1 = u32[] parameter(0)
       data2 = u32[] parameter(1)
-      // misplaced names to assure that dependencies are honored
+      // misordered names to assure that dependencies are honored
       cp3 = u32[] collective-permute(data1), source_target_pairs={{3,0}}
       cp1 = u32[] collective-permute(cp3), source_target_pairs={{0,1},{1,2},{2,3}}
       cp2 = u32[] collective-permute(cp1), source_target_pairs={{6,7}}
       ROOT out = u32[8] broadcast(cp2), dimensions={}
     })";
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, Transform(hlo));
-  TF_ASSERT_OK_AND_ASSIGN(HloInstruction * send,
-                          FindWithPairs(*module, "send", "{{3,0}}"));
-  TF_ASSERT_OK_AND_ASSIGN(
-      HloInstruction * send_1,
-      FindWithPairs(*module, "send.1", "{{0,1},{1,2},{2,3}}"));
-  TF_ASSERT_OK_AND_ASSIGN(
-      HloInstruction * recv_1,
-      FindWithPairs(*module, "recv.1", "{{0,1},{1,2},{2,3}}"));
-  TF_ASSERT_OK_AND_ASSIGN(auto recv_2,
-                          FindWithPairs(*module, "recv.2", "{{6,7}}"));
+  Decomposed cp1 = FindComponents(module.get(), "cp1");
+  Decomposed cp2 = FindComponents(module.get(), "cp2");
+  Decomposed cp3 = FindComponents(module.get(), "cp3");
   // Expect the CPs to be sorted by name before inserting control dependencies.
-  EXPECT_THAT(recv_1->control_predecessors(), ElementsAre(send));
-  EXPECT_THAT(recv_2->control_predecessors(), ElementsAre(send_1));
+  EXPECT_THAT(cp1.recv->control_predecessors(), ElementsAre(cp3.send));
+  EXPECT_THAT(cp2.recv->control_predecessors(), ElementsAre(cp1.send));
+}
+
+void AssurePreservedInfo(const HloInstruction* instr) {
+  SCOPED_TRACE("AssurePreservedInfo for: " + instr->ToString());
+  EXPECT_EQ(instr->channel_id().value(), 1);
+  EXPECT_EQ(instr->metadata().op_name(), "op1/op2/add");
+  EXPECT_EQ(instr->metadata().source_file(), "foo/bar/mysource.py");
+  EXPECT_EQ(instr->metadata().source_line(), 35);
+
+  EXPECT_THAT(
+      instr->ToString(),
+      HasSubstr(
+          "_xla_send_recv_source_target_pairs={{0,1},{1,2},{2,3},{3,4}}"));
+  const FrontendAttributes& attributes = instr->frontend_attributes();
+  EXPECT_FALSE(attributes.map().contains(kSendRecvPipelineAttr))
+      << "No pipeline attribute";
 }
 
 TEST_F(DecomposerTest, WithMetadata) {
@@ -195,46 +199,25 @@ TEST_F(DecomposerTest, WithMetadata) {
     }
   )";
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, Transform(hlo));
-
-  auto check_metadata = [](const HloInstruction* inst) {
-    EXPECT_EQ(inst->metadata().op_name(), "op1/op2/add");
-    EXPECT_EQ(inst->metadata().source_file(), "foo/bar/mysource.py");
-    EXPECT_EQ(inst->metadata().source_line(), 35);
-  };
-
-  auto check_not_pipelined = [](const HloInstruction* instr) {
-    const FrontendAttributes& attributes = instr->frontend_attributes();
-    EXPECT_EQ(attributes.map().end(),
-              attributes.map().find(kSendRecvPipelineAttr));
-  };
-
-  HloInstruction* after_all = FindInstruction(module.get(), "after-all");
-  HloInstruction* recv = FindInstruction(module.get(), "recv");
-  EXPECT_EQ(recv->operand(0), after_all);
-  EXPECT_EQ(recv->channel_id().value(), 1);
-  EXPECT_THAT(
-      recv->ToString(),
-      HasSubstr(
-          "_xla_send_recv_source_target_pairs={{0,1},{1,2},{2,3},{3,4}}"));
-  check_metadata(recv);
-  check_not_pipelined(recv);
-  HloInstruction* recv_done = FindInstruction(module.get(), "recv-done");
-  EXPECT_EQ(recv_done->operand(0), recv);
-
-  HloInstruction* send = FindInstruction(module.get(), "send");
-  EXPECT_EQ(send->operand(1), after_all);
-  EXPECT_EQ(send->channel_id().value(), 1);
-  EXPECT_THAT(
-      send->ToString(),
-      HasSubstr(
-          "_xla_send_recv_source_target_pairs={{0,1},{1,2},{2,3},{3,4}}"));
-  check_metadata(send);
-  check_not_pipelined(send);
-  HloInstruction* send_done = FindInstruction(module.get(), "send-done");
-  EXPECT_EQ(send_done->operand(0), send);
-
+  Decomposed cp = FindComponents(module.get(), "cp");
   HloInstruction* root = module->entry_computation()->root_instruction();
-  EXPECT_THAT(root, op::GetTupleElement(recv_done, 0));
+
+  AssurePreservedInfo(cp.send);
+  AssurePreservedInfo(cp.recv);
+  EXPECT_EQ(cp.recv->operand(0), cp.after_all);
+  EXPECT_EQ(cp.send->operand(1), cp.after_all);
+  EXPECT_EQ(cp.recv_done->operand(0), cp.recv);
+  EXPECT_EQ(cp.send_done->operand(0), cp.send);
+  EXPECT_THAT(root, op::GetTupleElement(cp.recv_done, 0));
+}
+
+std::string GetPipelineAttr(const HloInstruction* instr) {
+  const FrontendAttributes& attributes = instr->frontend_attributes();
+  return attributes.map().find(kSendRecvPipelineAttr)->second;
+}
+std::string GetOtherAttr(const HloInstruction* instr) {
+  const FrontendAttributes& attributes = instr->frontend_attributes();
+  return attributes.map().find("_xla_other_attribute")->second;
 }
 
 TEST_F(DecomposerTest, Pipeline1) {
@@ -277,30 +260,20 @@ TEST_F(DecomposerTest, Pipeline1) {
   })";
 
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module, Transform(hlo));
-  HloInstruction* recv = FindInstruction(module.get(), "recv");
-  EXPECT_EQ(recv->channel_id().value(), 1);
-  EXPECT_THAT(
-      recv->ToString(),
-      HasSubstr(
-          "_xla_send_recv_source_target_pairs={{0,1},{1,2},{2,3},{3,4}}"));
-  EXPECT_THAT(recv->ToString(), HasSubstr("_xla_send_recv_pipeline=\"0\""));
-  EXPECT_THAT(recv->ToString(), HasSubstr("_xla_other_attribute=\"xyz\""));
-  HloInstruction* recv_done = FindInstruction(module.get(), "recv-done");
-  EXPECT_THAT(recv_done->ToString(),
-              HasSubstr("_xla_send_recv_pipeline=\"0\""));
+  HloInstruction* recv = FindInstruction(module.get(), "recv-data-recv");
+  HloInstruction* send = FindInstruction(module.get(), "recv-data-send");
+  HloInstruction* recv_done =
+      FindInstruction(module.get(), "recv-data-recv-done");
+  HloInstruction* send_done =
+      FindInstruction(module.get(), "recv-data-send-done");
 
-  HloInstruction* send = FindInstruction(module.get(), "send");
-  EXPECT_EQ(send->channel_id().value(), 1);
-  EXPECT_THAT(
-      send->ToString(),
-      HasSubstr(
-          "_xla_send_recv_source_target_pairs={{0,1},{1,2},{2,3},{3,4}}"));
-  EXPECT_THAT(send->ToString(), HasSubstr("_xla_send_recv_pipeline=\"0\""));
-  EXPECT_THAT(send->ToString(), HasSubstr("_xla_other_attribute=\"xyz\""));
-  HloInstruction* send_done = FindInstruction(module.get(), "send-done");
-  EXPECT_THAT(send_done->ToString(),
-              HasSubstr("_xla_send_recv_pipeline=\"0\""));
-
+  EXPECT_EQ(GetPipelineAttr(recv), "0");
+  EXPECT_EQ(GetPipelineAttr(send), "0");
+  EXPECT_EQ(GetPipelineAttr(recv_done), "0");
+  EXPECT_EQ(GetPipelineAttr(send_done), "0");
+  EXPECT_EQ(GetOtherAttr(recv), "xyz") << "Preseving other attributes";
+  EXPECT_EQ(GetOtherAttr(send), "xyz") << "Preseving other attributes";
+  ;
   EXPECT_THAT(send->control_predecessors(), ElementsAre(recv));
   EXPECT_THAT(recv_done->control_predecessors(), ElementsAre(send));
 }
