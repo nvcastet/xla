@@ -13,10 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "xla/pjrt/cpu/gloo_collectives.h"
+#include "xla/backends/cpu/collectives/gloo_collectives.h"
 
 #include <cstddef>
-#include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -52,8 +51,7 @@ GlooCollectives::GlooCollectives(
 GlooCollectives::~GlooCollectives() = default;
 
 absl::StatusOr<std::vector<std::unique_ptr<Communicator>>>
-GlooCollectives::CreateCommunicators(int32_t nranks,
-                                     const CliqueKey& clique_key,
+GlooCollectives::CreateCommunicators(const CliqueKey& clique_key,
                                      const std::optional<CliqueId>& clique_id,
                                      absl::Span<const DeviceRank> ranks,
                                      const Config& config) {
